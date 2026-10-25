@@ -1,0 +1,506 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Preflow\Media;
+
+use Preflow\Data\DataManager;
+use Preflow\Data\DynamicRecord;
+use Preflow\Data\Locales;
+use Preflow\Data\TypeDefinition;
+use Preflow\Data\TypeFieldDefinition;
+use Preflow\Media\Image\Orientation;
+use Preflow\Media\Image\VariantGenerator;
+use Preflow\Media\Usage\AssetInUseException;
+use Preflow\Media\Usage\AssetUsage;
+use Psr\Http\Message\UploadedFileInterface;
+
+/**
+ * The shared media library. Files live in a public directory served by the web
+ * server ({dir}/Y/m/{id}.{ext}); their metadata are records of a code-defined
+ * type (key "_asset", table "folio_assets"). The extension always follows the
+ * sniffed MIME type, never the client's file name, and only allowed types are
+ * stored, so nothing executable can land in the public directory.
+ *
+ * Private assets live in config "private_dir", outside the public directory,
+ * without variants; their only URL is {private_url}/{id}, which a gated
+ * controller serves.
+ *
+ * Deleting refuses an asset that a registered usage source still reports
+ * (AssetInUseException), so every UI gets the rule.
+ */
+final class MediaLibrary
+{
+    /** Allowed MIME types and the extension each is stored with. */
+    private const array EXTENSIONS = [
+        'image/jpeg' => 'jpg',
+        'image/png' => 'png',
+        'image/gif' => 'gif',
+        'image/webp' => 'webp',
+        'image/avif' => 'avif',
+        'image/svg+xml' => 'svg',
+        'video/mp4' => 'mp4',
+        'video/webm' => 'webm',
+        'application/pdf' => 'pdf',
+        'text/plain' => 'txt',
+        'text/csv' => 'csv',
+        'application/zip' => 'zip',
+        'video/quicktime' => 'mov',
+        'application/msword' => 'doc',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document' => 'docx',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' => 'xlsx',
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation' => 'pptx',
+    ];
+
+    /** Images above this many pixels are kept but get no variants (decoding them could exhaust memory). */
+    private const int DEFAULT_MAX_PIXELS = 30_000_000;
+
+    public const string ID_PATTERN = '/^[a-f0-9]{32}$/';
+
+    private ?TypeDefinition $definition = null;
+
+    /** @var \Closure(): \DateTimeImmutable */
+    private readonly \Closure $now;
+
+    /**
+     * @param array<string, mixed> $config MediaConfig::toArray() (storage, max_bytes, allow_svg, private_dir, private_url, …)
+     */
+    public function __construct(
+        private readonly DataManager $dm,
+        private readonly Locales $locales,
+        private readonly string $dir,
+        private readonly string $url,
+        private readonly array $config = [],
+        private readonly ?VariantGenerator $variants = null,
+        ?\Closure $now = null,
+        private readonly ?AssetUsage $usage = null,
+    ) {
+        $this->now = $now ?? static fn (): \DateTimeImmutable => new \DateTimeImmutable();
+    }
+
+    public function definition(): TypeDefinition
+    {
+        if ($this->definition !== null) {
+            return $this->definition;
+        }
+        $fields = [];
+        foreach (['path', 'original_name', 'mime', 'size', 'width', 'height', 'duration', 'alt', 'title', 'focal_x', 'focal_y', 'poster', 'variants', 'created_at', 'created_by'] as $name) {
+            $fields[$name] = new TypeFieldDefinition($name, 'string', translatable: $name === 'alt');
+        }
+        $fields['private'] = new TypeFieldDefinition('private', 'boolean'); // missing on older records: public
+
+        return $this->definition = new TypeDefinition(
+            key: '_asset',
+            table: 'folio_assets',
+            storage: (string) ($this->config['storage'] ?? 'json'),
+            fields: $fields,
+            idField: 'uuid',
+            locales: $this->locales,
+        );
+    }
+
+    /**
+     * @param bool $private store in the private directory, served only through the gated URL
+     * @throws AssetUploadException
+     */
+    public function upload(UploadedFileInterface $file, ?string $by, bool $private = false): Asset
+    {
+        $name = (string) ($file->getClientFilename() ?? 'upload');
+        if ($file->getError() !== UPLOAD_ERR_OK) {
+            throw new AssetUploadException("{$name}: the upload failed (error {$file->getError()}).");
+        }
+        $this->checkSize($name, (int) ($file->getSize() ?? 0));
+        $stream = $file->getStream();
+        if ($stream->isSeekable()) {
+            $stream->rewind();
+        }
+
+        return $this->store($stream->getContents(), $name, $by, $private);
+    }
+
+    /**
+     * Copy a file on disk into the library (the source stays where it is).
+     *
+     * @throws AssetUploadException
+     */
+    public function importFile(string $absPath, string $originalName, ?string $by): Asset
+    {
+        if (!is_file($absPath) || !is_readable($absPath)) {
+            throw new AssetUploadException("{$originalName}: the file does not exist.");
+        }
+        $this->checkSize($originalName, (int) filesize($absPath));
+
+        return $this->store((string) file_get_contents($absPath), $originalName, $by);
+    }
+
+    public function find(string $id): ?Asset
+    {
+        if (preg_match(self::ID_PATTERN, $id) !== 1) {
+            return null;
+        }
+        $record = $this->dm->findIn($this->definition(), $id);
+
+        return $record === null ? null : Asset::fromRecord($record);
+    }
+
+    /** @return list<Asset> newest first */
+    public function all(): array
+    {
+        $assets = array_map(Asset::fromRecord(...), array_values($this->dm->queryIn($this->definition())->get()->items()));
+        usort($assets, static fn (Asset $a, Asset $b) => [$b->createdAt, $b->id] <=> [$a->createdAt, $a->id]);
+
+        return $assets;
+    }
+
+    /**
+     * Edit metadata: alt (merged per locale), title, focal_x/focal_y (0–100),
+     * poster (an image asset id; anything else clears it).
+     *
+     * @param array<string, mixed> $meta
+     */
+    public function update(string $id, array $meta): Asset
+    {
+        $asset = $this->find($id) ?? throw new \InvalidArgumentException("Unknown asset {$id}.");
+        $data = $asset->toData();
+
+        if (is_array($meta['alt'] ?? null)) {
+            $alt = $asset->alt;
+            foreach ($meta['alt'] as $locale => $text) {
+                if (is_string($locale) && $this->locales->has($locale) && is_string($text)) {
+                    $alt[$locale] = trim($text);
+                }
+            }
+            $data['alt'] = $alt;
+        }
+        if (array_key_exists('title', $meta)) {
+            $data['title'] = is_string($meta['title']) ? trim($meta['title']) : '';
+        }
+        foreach (['focal_x', 'focal_y'] as $key) {
+            if (array_key_exists($key, $meta) && is_numeric($meta[$key])) {
+                $data[$key] = max(0, min(100, (int) round((float) $meta[$key])));
+            }
+        }
+        if (array_key_exists('poster', $meta)) {
+            $poster = is_string($meta['poster']) && $meta['poster'] !== $id ? $this->find($meta['poster']) : null;
+            $data['poster'] = $poster !== null && $poster->kind() === 'image' ? $poster->id : '';
+        }
+
+        return $this->save($data);
+    }
+
+    /** @throws AssetInUseException while a usage source reports the asset (nothing is deleted) */
+    public function delete(string $id): void
+    {
+        $asset = $this->find($id);
+        if ($asset === null) {
+            return;
+        }
+        $usages = $this->usage?->of($id) ?? [];
+        if ($usages !== []) {
+            throw new AssetInUseException($id, $usages);
+        }
+        if ($asset->private) {
+            $file = $this->file($asset);
+            if ($file !== null && is_file($file)) {
+                unlink($file);
+            }
+            $this->dm->deleteIn($this->definition(), $id);
+
+            return;
+        }
+        foreach ([$asset->path, ...array_map(static fn (Variant $v) => $v->path, $asset->variants)] as $path) {
+            $file = $this->absolute($path);
+            if (is_file($file)) {
+                unlink($file);
+            }
+        }
+        $this->variants?->remove($asset, $this->dir); // also those made on demand
+        $this->dm->deleteIn($this->definition(), $id);
+    }
+
+    /**
+     * The file of one variant, made now if missing. Only widths in $allowed
+     * (and the original width, which srcsets list when it is narrower than
+     * the largest) and never wider than the original; null for anything else.
+     * Concurrent first requests wait on a per-file lock, so it is encoded once.
+     *
+     * @param list<int> $allowed
+     */
+    public function variantFile(Asset $asset, int $width, string $format, array $allowed): ?string
+    {
+        if (!$this->allowsVariant($asset, $width, $format, $allowed)) {
+            return null;
+        }
+
+        $rel = substr($asset->path, 0, (int) strrpos($asset->path, '.')) . "-{$width}.{$format}";
+        $file = $this->absolute($rel);
+        if (is_file($file)) {
+            return $file;
+        }
+        if (!is_dir(dirname($file)) && !@mkdir(dirname($file), 0775, true) && !is_dir(dirname($file))) {
+            return null;
+        }
+        $lock = @fopen($file . '.lock', 'c');
+        if ($lock === false) {
+            return null;
+        }
+        try {
+            flock($lock, LOCK_EX);
+            clearstatcache(true, $file);
+            if (!is_file($file)) {
+                $this->variants->generateOne($this->dir, $asset->path, $asset->mime, $width, $format);
+            }
+        } finally {
+            flock($lock, LOCK_UN);
+            fclose($lock);
+            @unlink($file . '.lock');
+        }
+
+        return is_file($file) ? $file : null;
+    }
+
+    /**
+     * Whether a variant may exist: an allowed width (or the original width when
+     * it is narrower than the largest), never wider than the original, for a
+     * format the asset already has variants in (so a srcset lists it) and the
+     * backend can still write.
+     *
+     * @param list<int> $allowed
+     */
+    public function allowsVariant(Asset $asset, int $width, string $format, array $allowed): bool
+    {
+        if ($this->variants === null || $asset->private || $asset->width === null || $asset->height === null || $width > $asset->width
+            || !$this->variants->supports($asset->mime, $format)
+            || array_filter($asset->variants, static fn (Variant $v) => $v->format === $format) === []
+            || $asset->width * $asset->height > (int) ($this->config['max_pixels'] ?? self::DEFAULT_MAX_PIXELS)) {
+            return false;
+        }
+        $isOriginal = $width === $asset->width && $allowed !== [] && $width < max($allowed);
+
+        return in_array($width, $allowed, true) || $isOriginal;
+    }
+
+    /** The closest variant made at upload (the largest not wider, else the smallest), else the original. */
+    public function nearestVariant(Asset $asset, int $width, string $format): string
+    {
+        $made = array_values(array_filter($asset->variants, fn (Variant $v) => $v->format === $format && is_file($this->absolute($v->path))));
+        usort($made, static fn (Variant $a, Variant $b) => $a->width <=> $b->width);
+        $fit = array_values(array_filter($made, static fn (Variant $v) => $v->width <= $width));
+
+        return ($fit !== [] ? end($fit) : ($made[0] ?? null))?->path ?? $asset->path;
+    }
+
+    /**
+     * Make every allowed variant the image can fill, in advance
+     * (media:variants --all). Returns how many were new.
+     *
+     * @param list<int> $allowed
+     */
+    public function warm(Asset $asset, array $allowed): int
+    {
+        $made = 0;
+        foreach (['avif', 'webp'] as $format) {
+            foreach ($allowed as $width) {
+                $rel = substr($asset->path, 0, (int) strrpos($asset->path, '.')) . "-{$width}.{$format}";
+                $had = is_file($this->absolute($rel));
+                if ($this->variantFile($asset, $width, $format, $allowed) !== null && !$had) {
+                    $made++;
+                }
+            }
+        }
+
+        return $made;
+    }
+
+    /** Replace an image's variants (e.g. after the configured widths changed). */
+    public function regenerate(Asset $asset): Asset
+    {
+        if ($this->variants === null || $asset->private) {
+            return $asset;
+        }
+        $this->variants->remove($asset, $this->dir);
+        $data = $asset->toData();
+        $data['variants'] = array_map(static fn (Variant $v) => $v->toArray(), $this->generateVariants($asset));
+
+        return $this->save($data);
+    }
+
+    /** The URL of an asset (a private one: only the gated {private_url}/{id}) or of a path under the media URL. */
+    public function url(Asset|string $target): string
+    {
+        if ($target instanceof Asset) {
+            if ($target->private) {
+                return rtrim((string) ($this->config['private_url'] ?? '/files'), '/') . '/' . $target->id;
+            }
+            $target = $target->path;
+        }
+
+        return rtrim($this->url, '/') . '/' . ltrim($target, '/');
+    }
+
+    /** The private directory (config "private_dir"); null when none is configured. */
+    public function privateDir(): ?string
+    {
+        $dir = $this->config['private_dir'] ?? null;
+
+        return is_string($dir) && $dir !== '' ? rtrim($dir, '/') : null;
+    }
+
+    /** The asset's file on disk (unchecked; the private route confines it with realpath); null for a private asset without a private dir. */
+    public function file(Asset $asset): ?string
+    {
+        if (!$asset->private) {
+            return $this->absolute($asset->path);
+        }
+        $dir = $this->privateDir();
+
+        return $dir === null ? null : $dir . '/' . ltrim($asset->path, '/');
+    }
+
+    public function absolute(string $relativePath): string
+    {
+        return rtrim($this->dir, '/') . '/' . ltrim($relativePath, '/');
+    }
+
+    /** A small preview URL: the 480 (else smallest) WebP variant, else the original image; null for other files. */
+    public function thumbnailUrl(Asset $asset): ?string
+    {
+        if ($asset->kind() !== 'image') {
+            return null;
+        }
+        if ($asset->private) {
+            return $this->url($asset); // gated: staff need the private permission (or "*") to see it
+        }
+        $webp = array_filter($asset->variants, static fn (Variant $v) => $v->format === 'webp');
+        usort($webp, static fn (Variant $a, Variant $b) => [$a->width !== 480, $a->width] <=> [$b->width !== 480, $b->width]);
+
+        return $this->url(($webp[0] ?? null)?->path ?? $asset->path);
+    }
+
+    /** True for the id of an existing asset (never for a path). */
+    public function isAssetId(string $value): bool
+    {
+        return $this->find($value) !== null;
+    }
+
+    /** @throws AssetUploadException */
+    private function store(string $bytes, string $name, ?string $by, bool $private = false): Asset
+    {
+        $mime = (new \finfo(FILEINFO_MIME_TYPE))->buffer($bytes) ?: 'application/octet-stream';
+        if ($mime === 'image/svg+xml' && ($this->config['allow_svg'] ?? false) !== true) {
+            throw new AssetUploadException('SVG uploads are disabled.');
+        }
+        $ext = self::EXTENSIONS[$mime] ?? null;
+        if ($ext === null) {
+            throw new AssetUploadException("{$name}: files of type {$mime} are not allowed.");
+        }
+
+        $now = ($this->now)();
+        $id = bin2hex(random_bytes(16));
+        $path = $now->format('Y/m') . '/' . $id . '.' . $ext;
+        if ($private && $this->privateDir() === null) {
+            throw new AssetUploadException("{$name}: no private directory is configured (assets.private_dir).");
+        }
+        $file = $private ? $this->privateDir() . '/' . $path : $this->absolute($path);
+        if (!is_dir(dirname($file)) && !mkdir(dirname($file), 0775, true) && !is_dir(dirname($file))) {
+            throw new AssetUploadException('The media directory is not writable.');
+        }
+        if (file_put_contents($file, $bytes) !== strlen($bytes)) {
+            @unlink($file);
+            throw new AssetUploadException("{$name}: the file could not be written to the media directory.");
+        }
+
+        $width = $height = null;
+        if (str_starts_with($mime, 'image/') && $mime !== 'image/svg+xml') {
+            $size = @getimagesize($file);
+            if (is_array($size)) {
+                [$width, $height] = [(int) $size[0], (int) $size[1]];
+                if (Orientation::swapsAxes(Orientation::of($file))) {
+                    [$width, $height] = [$height, $width]; // stored as displayed
+                }
+            }
+        }
+
+        $asset = new Asset(
+            id: $id,
+            path: $path,
+            originalName: mb_substr(basename(str_replace('\\', '/', $name)), 0, 255),
+            mime: $mime,
+            size: strlen($bytes),
+            width: $width,
+            height: $height,
+            duration: null,
+            alt: [],
+            title: '',
+            focalX: 50,
+            focalY: 50,
+            posterId: null,
+            variants: [],
+            createdAt: $now->format(DATE_ATOM),
+            createdBy: $by,
+            private: $private,
+        );
+        // The record first: if variant generation dies (time or memory limit), the
+        // file is still a usable asset whose variants can be made later.
+        $asset = $this->save($asset->toData());
+        if ($private) {
+            return $asset; // no variants: they would be public files
+        }
+        $data = $asset->toData();
+        $data['variants'] = array_map(static fn (Variant $v) => $v->toArray(), $this->generateVariants($asset));
+        if ($data['variants'] === []) {
+            return $asset;
+        }
+        $asset = $this->save($data);
+        // Optional: make the step widths now, so a page full of new images does not
+        // start many encodes at once on its first view (assets.warm_on_upload).
+        if (($this->config['warm_on_upload'] ?? false) === true && is_array($this->config['warm_widths'] ?? null)) {
+            $this->warm($asset, array_values(array_map('intval', $this->config['warm_widths'])));
+        }
+
+        return $asset;
+    }
+
+    /** @return list<Variant> */
+    private function generateVariants(Asset $asset): array
+    {
+        if ($this->variants === null || $asset->width === null || $asset->height === null) {
+            return [];
+        }
+        if ($asset->width * $asset->height > (int) ($this->config['max_pixels'] ?? self::DEFAULT_MAX_PIXELS)) {
+            return [];
+        }
+        try {
+            return $this->variants->generate($this->dir, $asset->path, $asset->mime, $asset->width);
+        } catch (\Throwable) {
+            return [];
+        }
+    }
+
+    /** @param array<string, mixed> $data */
+    private function save(array $data): Asset
+    {
+        $record = DynamicRecord::fromArray($this->definition(), $data);
+        $this->dm->saveType($record, false);
+
+        return Asset::fromRecord($record);
+    }
+
+    /** @throws AssetUploadException */
+    private function checkSize(string $name, int $bytes): void
+    {
+        $limit = (int) ($this->config['max_bytes'] ?? 20 * 1024 * 1024);
+        if ($bytes > $limit) {
+            throw new AssetUploadException("{$name} is larger than the " . self::humanBytes($limit) . ' limit.');
+        }
+    }
+
+    private static function humanBytes(int $bytes): string
+    {
+        return match (true) {
+            $bytes >= 1048576 => round($bytes / 1048576, 1) . ' MB',
+            $bytes >= 1024 => round($bytes / 1024) . ' KB',
+            default => $bytes . ' B',
+        };
+    }
+}
